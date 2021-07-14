@@ -24,10 +24,11 @@ namespace Microsoft.DotNet.Watcher.Tools
 {
     public class BrowserRefreshServer : IAsyncDisposable
     {
+        public readonly string ServerId = Guid.NewGuid().ToString();
         private readonly byte[] ReloadMessage = Encoding.UTF8.GetBytes("Reload");
         private readonly byte[] WaitMessage = Encoding.UTF8.GetBytes("Wait");
         private readonly JsonSerializerOptions _jsonSerializerOptions = new(JsonSerializerDefaults.Web);
-        private readonly List<WebSocket> _clientSockets = new();
+        private readonly List<(WebSocket clientSocket, string clientId)> _clientSockets = new();
         private readonly IReporter _reporter;
         private readonly TaskCompletionSource _terminateWebSocket;
         private readonly TaskCompletionSource _clientConnected;
@@ -100,7 +101,19 @@ namespace Microsoft.DotNet.Watcher.Tools
                 return;
             }
 
-            _clientSockets.Add(await context.WebSockets.AcceptWebSocketAsync());
+            var clientSocket = await context.WebSockets.AcceptWebSocketAsync();
+            var clientId = Guid.NewGuid().ToString();
+
+            // Share identifiers with the client as soon as it connects.
+            var message = new SharedIdentifiersMessage
+            {
+                ServerId = ServerId,
+                ClientId = clientId,
+            };
+            var messageBytes = JsonSerializer.SerializeToUtf8Bytes(message, _jsonSerializerOptions);
+            await clientSocket.SendAsync(messageBytes, WebSocketMessageType.Text, endOfMessage: true, default);
+
+            _clientSockets.Add((clientSocket, clientId));
             _clientConnected.TrySetResult();
             await _terminateWebSocket.Task;
         }
@@ -119,7 +132,7 @@ namespace Microsoft.DotNet.Watcher.Tools
             {
                 for (var i = 0; i < _clientSockets.Count; i++)
                 {
-                    var clientSocket = _clientSockets[i];
+                    var (clientSocket, _) = _clientSockets[i];
                     if (clientSocket.State is not WebSocketState.Open)
                     {
                         continue;
@@ -141,7 +154,7 @@ namespace Microsoft.DotNet.Watcher.Tools
         {
             for (var i = 0; i < _clientSockets.Count; i++)
             {
-                var clientSocket = _clientSockets[i];
+                var (clientSocket, _) = _clientSockets[i];
                 await clientSocket.CloseOutputAsync(WebSocketCloseStatus.Empty, null, default);
                 clientSocket.Dispose();
             }
@@ -154,11 +167,11 @@ namespace Microsoft.DotNet.Watcher.Tools
             _terminateWebSocket.TrySetResult();
         }
 
-        public async ValueTask<ValueWebSocketReceiveResult?> ReceiveAsync(Memory<byte> buffer, CancellationToken cancellationToken)
+        public async ValueTask<(ValueWebSocketReceiveResult? result, string clientId)> ReceiveAsync(Memory<byte> buffer, CancellationToken cancellationToken)
         {
             for (int i = 0; i < _clientSockets.Count; i++)
             {
-                var clientSocket = _clientSockets[i];
+                var (clientSocket, clientId) = _clientSockets[i];
 
                 if (clientSocket.State is not WebSocketState.Open)
                 {
@@ -167,7 +180,8 @@ namespace Microsoft.DotNet.Watcher.Tools
 
                 try
                 {
-                    return await clientSocket.ReceiveAsync(buffer, cancellationToken);
+                    var result = await clientSocket.ReceiveAsync(buffer, cancellationToken);
+                    return (result, clientId);
                 }
                 catch (Exception ex)
                 {
@@ -194,6 +208,13 @@ namespace Microsoft.DotNet.Watcher.Tools
             {
                 return false;
             }
+        }
+
+        private readonly struct SharedIdentifiersMessage
+        {
+            public string Type => "SetSharedIdentifiers";
+            public string ServerId { get; init; }
+            public string ClientId { get; init; }
         }
     }
 }

@@ -16,6 +16,8 @@ setTimeout(async function () {
   }
 
   let waiting = false;
+  let cachedServerId;
+  let cachedClientId;
 
   connection.onmessage = function (message) {
     if (message.data === 'Reload') {
@@ -34,8 +36,9 @@ setTimeout(async function () {
     } else {
       const payload = JSON.parse(message.data);
       const action = {
+        'SetSharedIdentifiers': () => setSharedIdentifiers(payload.serverId, payload.clientId),
         'UpdateStaticFile': () => updateStaticFile(payload.path),
-        'BlazorHotReloadDeltav1': () => applyBlazorDeltas(payload.deltas),
+        'BlazorHotReloadDeltav1': () => applyBlazorDeltas(payload.serverId, payload.deltas),
         'HotReloadDiagnosticsv1': () => displayDiagnostics(payload.diagnostics),
         'BlazorRequestApplyUpdateCapabilities': getBlazorWasmApplyUpdateCapabilities,
         'AspNetCoreHotReloadApplied': () => aspnetCoreHotReloadApplied()
@@ -52,6 +55,11 @@ setTimeout(async function () {
   connection.onerror = function (event) { console.debug('dotnet-watch reload socket error.', event) }
   connection.onclose = function () { console.debug('dotnet-watch reload socket closed.') }
   connection.onopen = function () { console.debug('dotnet-watch reload socket connected.') }
+
+  function setSharedIdentifiers(serverId, clientId) {
+    cachedServerId = serverId;
+    cachedClientId = clientId;
+  }
 
   function updateStaticFile(path) {
     if (path && path.endsWith('.css')) {
@@ -91,7 +99,7 @@ setTimeout(async function () {
     } catch {
       applyUpdateCapabilities = '';
     }
-    connection.send(applyUpdateCapabilities);
+    connection.send(JSON.stringify({clientId: cachedClientId, capabilities: applyUpdateCapabilities}));
   }
 
   function updateCssElement(styleElement) {
@@ -115,7 +123,11 @@ setTimeout(async function () {
     styleElement.parentNode.insertBefore(newElement, styleElement.nextSibling);
   }
 
-  function applyBlazorDeltas(deltas) {
+  function applyBlazorDeltas(serverId, deltas) {
+    if (serverId != cachedServerId) {
+      throw 'Unable to validate the server. Rejecting apply-update payload.';
+    }
+
     let applyFailed = false;
     deltas.forEach(d => {
       try {

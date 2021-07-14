@@ -1,6 +1,8 @@
 ﻿// Copyright (c) .NET Foundation and contributors. All rights reserved.
 // Licensed under the MIT license. See LICENSE file in the project root for full license information.
 
+#nullable enable
+
 using System;
 using System.Buffers;
 using System.Collections.Generic;
@@ -8,6 +10,7 @@ using System.Collections.Immutable;
 using System.Linq;
 using System.Net.WebSockets;
 using System.Text;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.CodeAnalysis.ExternalAccess.Watch.Api;
@@ -17,7 +20,7 @@ namespace Microsoft.DotNet.Watcher.Tools
 {
     internal class BlazorWebAssemblyDeltaApplier : IDeltaApplier
     {
-        private static Task<ImmutableArray<string>> _cachedCapabilties;
+        private static Task<ImmutableArray<string>>? _cachedCapabilties;
         private readonly IReporter _reporter;
         private int _sequenceId;
 
@@ -49,14 +52,14 @@ namespace Microsoft.DotNet.Watcher.Tools
 
                 await context.BrowserRefreshServer.WaitForClientConnectionAsync(cancellationToken);
 
-                await context.BrowserRefreshServer.SendJsonSerlialized(default(BlazorRequestApplyUpdateCapabilities), cancellationToken);
+                await context.BrowserRefreshServer.SendJsonSerlialized(default(BlazorApplyUpdateCapabilitiesRequest), cancellationToken);
                 // 32k ought to be enough for anyone.
                 var buffer = ArrayPool<byte>.Shared.Rent(32 * 1024);
                 try
                 {
                     // We'll query the browser and ask it send capabilities. If the browser does not respond in 10s, we'll assume something is amiss and return
                     // no capabilities. This should give you baseline hot reload capabilties.
-                    var response = await context.BrowserRefreshServer.ReceiveAsync(buffer, cancellationToken)
+                    var (response, clientId) = await context.BrowserRefreshServer.ReceiveAsync(buffer, cancellationToken)
                         .AsTask()
                         .WaitAsync(TimeSpan.FromSeconds(10), cancellationToken);
                     if (!response.HasValue || !response.Value.EndOfMessage || response.Value.MessageType != WebSocketMessageType.Text)
@@ -64,13 +67,19 @@ namespace Microsoft.DotNet.Watcher.Tools
                         return ImmutableArray<string>.Empty;
                     }
 
-                    var values = Encoding.UTF8.GetString(buffer.AsSpan(0, response.Value.Count));
+                    var capabiltiiesResponse = JsonSerializer.Deserialize<BlazorApplyUpdateCapabiltiiesResponse>(
+                        buffer.AsSpan(0, response.Value.Count),
+                        new JsonSerializerOptions(JsonSerializerDefaults.Web));
+                    if (capabiltiiesResponse.ClientId != clientId)
+                    {
+                        throw new InvalidOperationException($"Unknown client Id when receiving ApplyUpdateCapability response. Expected {clientId}, Actual {capabiltiiesResponse.ClientId}.");
+                    }
+
                     // Capabilitiies are expressed a space-separated string.
                     // e.g. https://github.com/dotnet/runtime/blob/14343bdc281102bf6fffa1ecdd920221d46761bc/src/coreclr/System.Private.CoreLib/src/System/Reflection/Metadata/AssemblyExtensions.cs#L87
-                    var result = values.Split(' ').ToImmutableArray();
-                    return result;
+                    return capabiltiiesResponse.Capabilities.Split(' ').ToImmutableArray();
                 }
-                catch (TaskCanceledException)
+                catch (TimeoutException)
                 {
                 }
                 finally
@@ -92,6 +101,7 @@ namespace Microsoft.DotNet.Watcher.Tools
 
             var payload = new UpdatePayload
             {
+                ServerId = context.BrowserRefreshServer.ServerId,
                 Deltas = solutionUpdate.Select(c => new UpdateDelta
                 {
                     SequenceId = _sequenceId++,
@@ -132,7 +142,7 @@ namespace Microsoft.DotNet.Watcher.Tools
                 // to loop before we decide that applying deltas failed.
                 for (var i = 0; i < 100; i++)
                 {
-                    var result = await context.BrowserRefreshServer.ReceiveAsync(_receiveBuffer, cancellationToken);
+                    var (result, clientId) = await context.BrowserRefreshServer!.ReceiveAsync(_receiveBuffer, cancellationToken);
                     if (result is null)
                     {
                         // A null result indicates no clients are connected. No deltas could have been applied in this state.
@@ -171,12 +181,14 @@ namespace Microsoft.DotNet.Watcher.Tools
         private readonly struct UpdatePayload
         {
             public string Type => "BlazorHotReloadDeltav1";
+            public string ServerId { get; init; }
             public IEnumerable<UpdateDelta> Deltas { get; init; }
         }
 
         private readonly struct UpdateDelta
         {
             public int SequenceId { get; init; }
+            public string ServerId { get; init; }
             public Guid ModuleId { get; init; }
             public byte[] MetadataDelta { get; init; }
             public byte[] ILDelta { get; init; }
@@ -190,9 +202,16 @@ namespace Microsoft.DotNet.Watcher.Tools
             public IEnumerable<string> Diagnostics { get; init; }
         }
 
-        private readonly struct BlazorRequestApplyUpdateCapabilities
+        private readonly struct BlazorApplyUpdateCapabilitiesRequest
         {
             public string Type => "BlazorRequestApplyUpdateCapabilities";
+        }
+
+        private readonly struct BlazorApplyUpdateCapabiltiiesResponse
+        {
+            public string ClientId { get; init; }
+
+            public string Capabilities { get; init; }
         }
     }
 }
